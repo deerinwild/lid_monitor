@@ -8,7 +8,7 @@ app = Flask(__name__)
 # 数据文件路径（Render 允许写入当前目录）
 DATA_FILE = "reports.json"
 # 简单令牌验证（与 App 中保持一致）
-API_TOKEN = "your-secret-token"   # 建议修改成一个复杂字符串
+API_TOKEN = "1panaway"   # 建议修改成一个复杂字符串
 
 def load_data():
     """加载已有数据"""
