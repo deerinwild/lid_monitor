@@ -1,8 +1,10 @@
 import os
 import json
 import subprocess
+import zipfile
+import io
 from datetime import datetime
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, send_from_directory
 
 app = Flask(__name__)
 
@@ -59,7 +61,6 @@ def save_data(data):
     except Exception as e:
         print(f"同步全量文件失败: {e}")
     
-    # 如果有新数据，将最新一条保存为独立时间戳文件
     if data:
         latest = data[-1]
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -97,11 +98,32 @@ def download_data():
         return "暂无数据", 404
     return send_file(DATA_FILE, as_attachment=True, download_name='reports.json')
 
+@app.route('/download-all', methods=['GET'])
+def download_all():
+    """打包所有 reports_*.json 文件为 ZIP 下载"""
+    files = [f for f in os.listdir('.') if f.startswith('reports_') and f.endswith('.json')]
+    if not files:
+        return "没有找到任何 reports_*.json 文件", 404
+    
+    # 创建 ZIP 内存文件
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        for file in files:
+            zip_file.write(file)
+    
+    zip_buffer.seek(0)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return send_file(
+        zip_buffer,
+        as_attachment=True,
+        download_name=f'reports_all_{timestamp}.zip',
+        mimetype='application/zip'
+    )
+
 @app.route('/')
 @app.route('/view')
 def index():
     all_data = load_data()
-    # 保持原来的 HTML 显示，略作修改
     html = '''
     <!DOCTYPE html>
     <html>
@@ -128,6 +150,7 @@ def index():
             <h1>📊 豆瓣举报任务统计</h1>
             <div class="toolbar">
                 <a href="/download" class="btn">⬇️ 下载 reports.json 备份</a>
+                <a href="/download-all" class="btn">📦 下载全部 reports_*.json (ZIP)</a>
                 <span style="font-size:13px; color:#6e6e73;">总上报次数: ''' + str(len(all_data)) + '''</span>
             </div>
             <div style="overflow-x: auto;">
@@ -155,7 +178,7 @@ def index():
                 </table>
             </div>
             <div class="footer">
-                数据已自动同步到 GitHub 私有仓库，每次上报均生成独立备份文件。
+                数据已自动同步到 GitHub 私有仓库，每次上报均生成独立备份文件。也可点击上方按钮打包下载全部 JSON 文件。
             </div>
         </div>
     </body>
