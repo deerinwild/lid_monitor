@@ -1,14 +1,63 @@
-from flask import Flask, request, jsonify, send_file
-import json
-from datetime import datetime
 import os
+import json
+import subprocess
+from datetime import datetime
+from flask import Flask, request, jsonify, send_file
 
 app = Flask(__name__)
 
-# 数据文件路径（Render 允许写入当前目录）
+# 数据文件路径
 DATA_FILE = "reports.json"
-# 简单令牌验证（与 App 中保持一致）
-API_TOKEN = "1panaway"   # 建议修改成一个复杂字符串
+
+# GitHub 仓库配置（从环境变量读取，避免硬编码）
+GITHUB_REPO_URL = os.environ.get("GITHUB_REPO_URL", "")
+GITHUB_REPO_DIR = "/tmp/repo"  # Render 临时目录，可写
+
+# 安全令牌（必须与 App 中一致）
+API_TOKEN = os.environ.get("API_TOKEN", "1panaway")
+
+def run_git_command(cmds, cwd=None):
+    """执行 git 命令，返回是否成功"""
+    result = subprocess.run(cmds, cwd=cwd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Git 命令执行失败: {cmds}\n{result.stderr}")
+        return False
+    return True
+
+def init_git_repo():
+    """初始化 Git 仓库（首次运行时克隆）"""
+    if not GITHUB_REPO_URL:
+        print("未配置 GITHUB_REPO_URL，跳过自动同步")
+        return False
+    if not os.path.exists(GITHUB_REPO_DIR):
+        print("克隆仓库...")
+        if not run_git_command(["git", "clone", GITHUB_REPO_URL, GITHUB_REPO_DIR]):
+            return False
+    # 设置用户信息（用于 commit）
+    run_git_command(["git", "config", "user.email", "render@backup"], cwd=GITHUB_REPO_DIR)
+    run_git_command(["git", "config", "user.name", "Render Backup"], cwd=GITHUB_REPO_DIR)
+    return True
+
+def sync_to_github():
+    """将当前 DATA_FILE 同步到 GitHub"""
+    if not GITHUB_REPO_URL:
+        return
+    if not init_git_repo():
+        return
+    
+    target_file = os.path.join(GITHUB_REPO_DIR, DATA_FILE)
+    # 复制文件到仓库目录
+    run_git_command(["cp", DATA_FILE, target_file])
+    # 添加变更
+    if not run_git_command(["git", "add", DATA_FILE], cwd=GITHUB_REPO_DIR):
+        return
+    # 提交
+    commit_msg = f"Auto-save: {datetime.now().isoformat()}"
+    if not run_git_command(["git", "commit", "-m", commit_msg], cwd=GITHUB_REPO_DIR):
+        # 如果没有变更，commit 会失败，这是正常的
+        return
+    # 推送
+    run_git_command(["git", "push"], cwd=GITHUB_REPO_DIR)
 
 def load_data():
     """加载已有数据"""
@@ -18,9 +67,14 @@ def load_data():
         return json.load(f)
 
 def save_data(data):
-    """保存数据到文件"""
+    """保存数据到文件并同步到 GitHub"""
     with open(DATA_FILE, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    # 异步同步到 GitHub（可改为后台线程，但简单场景够用）
+    try:
+        sync_to_github()
+    except Exception as e:
+        print(f"同步到 GitHub 失败: {e}")
 
 @app.route('/api/report', methods=['POST'])
 def report():
@@ -165,7 +219,7 @@ def index():
                 </table>
             </div>
             <div class="footer">
-                数据仅存储于服务器本地文件，建议定期下载备份。
+                数据已自动同步到 GitHub 私有仓库，建议定期检查。
             </div>
         </div>
     </body>
@@ -174,4 +228,7 @@ def index():
     return html
 
 if __name__ == '__main__':
+    # 启动前尝试初始化 Git 仓库（可选）
+    if GITHUB_REPO_URL:
+        init_git_repo()
     app.run(host='0.0.0.0', port=5000)
