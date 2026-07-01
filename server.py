@@ -3,27 +3,126 @@ import json
 import subprocess
 import zipfile
 import io
-from datetime import datetime
+import glob
+import shutil
+from datetime import datetime, timezone
 from html import escape
+from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify, send_file
 
 app = Flask(__name__)
 
 DATA_FILE = "reports.json"
 GITHUB_REPO_URL = os.environ.get("GITHUB_REPO_URL", "")
-GITHUB_REPO_DIR = "/tmp/repo"
+GITHUB_REPO_DIR = os.environ.get("GITHUB_REPO_DIR", "/tmp/repo")
 API_TOKEN = os.environ.get("API_TOKEN", "1panaway")
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", API_TOKEN)
+GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
 
 # 可选：如果你希望只允许固定 Chrome 插件来源访问 /api/report-proxy，
 # 可以在 Render 环境变量里设置：ALLOWED_EXTENSION_ORIGIN=chrome-extension://你的插件ID
 # 不设置则默认不限制 Origin，方便本地测试和重新加载插件。
 ALLOWED_EXTENSION_ORIGIN = os.environ.get("ALLOWED_EXTENSION_ORIGIN", "")
 
+SERVER_TIMEZONE = "Asia/Shanghai"
+TZ = ZoneInfo(SERVER_TIMEZONE)
+ARCHIVE_RECORDS_DIR = "archive/reports"
+ARCHIVE_SUMMARY_DIR = "archive/summary"
+LATEST_INDEX_PATH = os.environ.get("LATEST_INDEX_PATH", "latest.json")
+LATEST_INDEX_MAX_DAYS = int(os.environ.get("LATEST_INDEX_MAX_DAYS", "90"))
 
-def run_git_command(cmds, cwd=None):
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def parse_datetime(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        # 旧版 received_at 没有时区；Render 默认通常是 UTC，这里按 UTC 兼容。
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def beijing_day_key(date_like=None):
+    if isinstance(date_like, str):
+        dt = parse_datetime(date_like)
+    else:
+        dt = date_like
+    if dt is None:
+        dt = datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(TZ).strftime("%Y-%m-%d")
+
+
+def is_day_key(value):
+    text = str(value or "")
+    if len(text) != 10:
+        return False
+    try:
+        datetime.strptime(text, "%Y-%m-%d")
+        return True
+    except Exception:
+        return False
+
+
+def normalize_date(raw=None):
+    text = str(raw or "").strip()
+    return text if is_day_key(text) else beijing_day_key()
+
+
+def record_day_key(record):
+    # 归档日期统一按北京时间。优先使用服务器接收时间，其次使用插件上报时间。
+    for field in ("received_at", "timestamp"):
+        dt = parse_datetime(record.get(field))
+        if dt:
+            return beijing_day_key(dt)
+    return beijing_day_key()
+
+
+def month_info(date):
+    year, month, _ = date.split("-")
+    return year, month, f"{year}-{month}"
+
+
+def archive_paths_for_date(date):
+    year, month, month_key = month_info(date)
+    records_path = f"{ARCHIVE_RECORDS_DIR}/{year}/{month}/{date}.json"
+    summary_path = f"{ARCHIVE_SUMMARY_DIR}/{year}/{month_key}.json"
+    return records_path, summary_path, month_key
+
+
+def count(value, fallback=0):
+    try:
+        n = int(value)
+        return n if n >= 0 else fallback
+    except Exception:
+        return fallback
+
+
+def normalize_task_type(value):
+    raw = str(value or "").strip()
+    if raw == "manual":
+        return "local"
+    return raw or "unknown"
+
+
+def run_git_command(cmds, cwd=None, quiet=False):
     result = subprocess.run(cmds, cwd=cwd, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"Git 命令执行失败: {cmds}\n{result.stderr}")
+        if not quiet:
+            print(f"Git 命令执行失败: {cmds}\n{result.stderr}")
         return False
     return True
 
@@ -32,73 +131,227 @@ def init_git_repo():
     if not GITHUB_REPO_URL:
         print("未配置 GITHUB_REPO_URL，跳过自动同步")
         return False
-    if not os.path.exists(GITHUB_REPO_DIR):
+
+    git_dir = os.path.join(GITHUB_REPO_DIR, ".git")
+    if not os.path.exists(git_dir):
+        if os.path.exists(GITHUB_REPO_DIR):
+            shutil.rmtree(GITHUB_REPO_DIR, ignore_errors=True)
         print("克隆仓库...")
         if not run_git_command(["git", "clone", GITHUB_REPO_URL, GITHUB_REPO_DIR]):
             return False
-    run_git_command(["git", "config", "user.email", "render@backup"], cwd=GITHUB_REPO_DIR)
-    run_git_command(["git", "config", "user.name", "Render Backup"], cwd=GITHUB_REPO_DIR)
+    else:
+        # 每次写入前先拉最新仓库，避免 Render 重启或多实例导致覆盖远端文件。
+        run_git_command(["git", "fetch", "origin"], cwd=GITHUB_REPO_DIR, quiet=True)
+        run_git_command(["git", "pull", "--rebase", "origin", GITHUB_BRANCH], cwd=GITHUB_REPO_DIR, quiet=True)
+
+    run_git_command(["git", "config", "user.email", "render@backup"], cwd=GITHUB_REPO_DIR, quiet=True)
+    run_git_command(["git", "config", "user.name", "Render Backup"], cwd=GITHUB_REPO_DIR, quiet=True)
     return True
 
 
-def sync_to_github(file_name):
-    """将指定的文件同步到 GitHub 仓库"""
+def read_json_file(path, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"读取 JSON 失败 {path}: {e}")
+        return default
+
+
+def write_json_file(path, data):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+
+
+def read_repo_or_local_json(rel_path, default):
+    repo_path = os.path.join(GITHUB_REPO_DIR, rel_path)
+    if GITHUB_REPO_URL and os.path.exists(repo_path):
+        return read_json_file(repo_path, default)
+    return read_json_file(rel_path, default)
+
+
+def commit_repo_paths(rel_paths, message):
     if not GITHUB_REPO_URL:
-        return
+        return False
     if not init_git_repo():
-        return
-    source_path = file_name
-    target_path = os.path.join(GITHUB_REPO_DIR, file_name)
-    run_git_command(["cp", source_path, target_path])
-    run_git_command(["git", "add", file_name], cwd=GITHUB_REPO_DIR)
-    commit_msg = f"Auto-save: {datetime.now().isoformat()} - {file_name}"
-    run_git_command(["git", "commit", "-m", commit_msg], cwd=GITHUB_REPO_DIR)
-    run_git_command(["git", "push"], cwd=GITHUB_REPO_DIR)
+        return False
+
+    clean_paths = []
+    for rel_path in dict.fromkeys(rel_paths):
+        if not rel_path:
+            continue
+        clean_paths.append(rel_path)
+        src = rel_path
+        dst = os.path.join(GITHUB_REPO_DIR, rel_path)
+        if os.path.abspath(src) == os.path.abspath(dst):
+            continue
+        if os.path.exists(src):
+            os.makedirs(os.path.dirname(dst) or GITHUB_REPO_DIR, exist_ok=True)
+            shutil.copy2(src, dst)
+
+    if not clean_paths:
+        return False
+    run_git_command(["git", "add", *clean_paths], cwd=GITHUB_REPO_DIR)
+    # 没有变化时不提交，避免 Render 日志报错。
+    if run_git_command(["git", "diff", "--cached", "--quiet"], cwd=GITHUB_REPO_DIR, quiet=True):
+        return True
+    if not run_git_command(["git", "commit", "-m", message], cwd=GITHUB_REPO_DIR):
+        return False
+    return run_git_command(["git", "push", "origin", GITHUB_BRANCH], cwd=GITHUB_REPO_DIR)
 
 
 def load_data():
-    if not os.path.exists(DATA_FILE):
-        return []
-    try:
-        with open(DATA_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            return data if isinstance(data, list) else []
-    except Exception as e:
-        print(f"读取 {DATA_FILE} 失败: {e}")
-        return []
+    data = read_json_file(DATA_FILE, [])
+    return data if isinstance(data, list) else []
 
 
-def save_data(data):
-    # 保存全量累积数据
-    with open(DATA_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    try:
-        sync_to_github(DATA_FILE)
-    except Exception as e:
-        print(f"同步全量文件失败: {e}")
+def save_session_data(data):
+    # 仅保存 Render 当前进程内的短期备份。展示和 GitHub Pages 以后不再依赖根目录 reports_*.json。
+    write_json_file(DATA_FILE, data if isinstance(data, list) else [])
 
-    if data:
-        latest = data[-1]
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        single_file = f"reports_{timestamp}.json"
-        with open(single_file, 'w', encoding='utf-8') as f:
-            json.dump(latest, f, ensure_ascii=False, indent=2)
-        try:
-            sync_to_github(single_file)
-        except Exception as e:
-            print(f"同步单条记录失败: {e}")
+
+def last_seen_iso(records):
+    latest_dt = None
+    latest_text = ""
+    for r in records:
+        for field in ("received_at", "timestamp"):
+            dt = parse_datetime(r.get(field))
+            if dt and (latest_dt is None or dt > latest_dt):
+                latest_dt = dt
+                latest_text = r.get(field) or dt.isoformat()
+    return latest_dt.isoformat().replace("+00:00", "Z") if latest_dt else latest_text
+
+
+def summarize_records(date, records, records_path):
+    type_counts = {"daily": 0, "temp": 0, "local": 0, "unknown": 0}
+    user_set = set()
+    for r in records:
+        uid = str(r.get("userUid", "")).strip()
+        if uid:
+            user_set.add(uid)
+        t = normalize_task_type(r.get("taskType"))
+        type_counts[t] = type_counts.get(t, 0) + 1
+    return {
+        "date": date,
+        "recordsPath": records_path,
+        "reportCount": len(records),
+        "activeUsers": len(user_set),
+        "totalParsed": sum(count(r.get("totalParsed")) for r in records),
+        "submitted": sum(count(r.get("submitted")) for r in records),
+        "failed": sum(count(r.get("failed")) for r in records),
+        "whitelistSkipped": sum(count(r.get("whitelistSkipped")) for r in records),
+        "durationSeconds": sum(count(r.get("durationSeconds")) for r in records),
+        "taskTypes": type_counts,
+        "lastSeenAt": last_seen_iso(records),
+        "updatedAt": now_iso(),
+    }
+
+
+def default_latest_index():
+    return {
+        "version": 1,
+        "updatedAt": "",
+        "latestDate": "",
+        "latestMonth": "",
+        "latestRecordsPath": "",
+        "latestSummaryPath": "",
+        "days": [],
+    }
+
+
+def normalize_latest_entry(summary, summary_path, month_key):
+    return {
+        "date": summary.get("date", ""),
+        "month": month_key,
+        "recordsPath": summary.get("recordsPath", ""),
+        "summaryPath": summary_path,
+        "updatedAt": summary.get("updatedAt", now_iso()),
+        "reportCount": count(summary.get("reportCount")),
+        "activeUsers": count(summary.get("activeUsers")),
+        "totalParsed": count(summary.get("totalParsed")),
+        "submitted": count(summary.get("submitted")),
+        "failed": count(summary.get("failed")),
+        "whitelistSkipped": count(summary.get("whitelistSkipped")),
+        "lastSeenAt": summary.get("lastSeenAt", ""),
+    }
+
+
+def update_latest_index(latest, entry):
+    latest = latest if isinstance(latest, dict) else default_latest_index()
+    merged = {}
+    for item in latest.get("days", []) if isinstance(latest.get("days"), list) else []:
+        if item and is_day_key(item.get("date")):
+            merged[item["date"]] = item
+    if entry and is_day_key(entry.get("date")):
+        merged[entry["date"]] = entry
+    days = sorted(merged.values(), key=lambda item: item.get("date", ""), reverse=True)[:max(1, LATEST_INDEX_MAX_DAYS)]
+    latest.update(default_latest_index())
+    latest["version"] = 1
+    latest["updatedAt"] = now_iso()
+    latest["days"] = days
+    if days:
+        first = days[0]
+        latest["latestDate"] = first.get("date", "")
+        latest["latestMonth"] = first.get("month", "")
+        latest["latestRecordsPath"] = first.get("recordsPath", "")
+        latest["latestSummaryPath"] = first.get("summaryPath", "")
+    return latest
+
+
+def append_record_to_archive(record):
+    # 先拉取远端，再基于远端当天文件追加，避免 Render 重启后覆盖 GitHub 中已有日期数据。
+    init_git_repo()
+
+    date = record_day_key(record)
+    records_path, summary_path, month_key = archive_paths_for_date(date)
+
+    records = read_repo_or_local_json(records_path, [])
+    if not isinstance(records, list):
+        records = []
+    records.append(record)
+    write_json_file(records_path, records)
+
+    summary = read_repo_or_local_json(summary_path, {"month": month_key, "days": {}})
+    if not isinstance(summary, dict):
+        summary = {"month": month_key, "days": {}}
+    summary["month"] = month_key
+    summary["days"] = summary.get("days") if isinstance(summary.get("days"), dict) else {}
+    day_summary = summarize_records(date, records, records_path)
+    summary["days"][date] = day_summary
+    summary["updatedAt"] = now_iso()
+    write_json_file(summary_path, summary)
+
+    latest = read_repo_or_local_json(LATEST_INDEX_PATH, default_latest_index())
+    latest = update_latest_index(latest, normalize_latest_entry(day_summary, summary_path, month_key))
+    write_json_file(LATEST_INDEX_PATH, latest)
+
+    commit_repo_paths(
+        [records_path, summary_path, LATEST_INDEX_PATH, DATA_FILE],
+        f"Auto-save task report {date}"
+    )
+    return date, records_path
 
 
 def append_report(new_report):
     """统一保存上报记录。APK 和 Chrome 插件都会走这里，避免两套保存逻辑不一致。"""
-    new_report['received_at'] = datetime.now().isoformat()
+    new_report["received_at"] = now_iso()
+    new_report["taskType"] = normalize_task_type(new_report.get("taskType"))
+
     all_data = load_data()
     all_data.append(new_report)
-    save_data(all_data)
+    save_session_data(all_data)
+
+    archive_date, archive_path = append_record_to_archive(new_report)
     print(
         f"收到上报：来源 {new_report.get('clientType', 'unknown')}，"
-        f"用户 {new_report.get('userUid')} 提交 {new_report.get('submitted')} 条"
+        f"用户 {new_report.get('userUid')} 提交 {new_report.get('submitted')} 条，"
+        f"已写入 {archive_path}"
     )
+    return archive_date, archive_path
 
 
 def validate_proxy_payload(payload):
@@ -125,10 +378,7 @@ def validate_proxy_payload(payload):
     if not user_uid.isdigit():
         return None, (jsonify({"ok": False, "error": "invalid_userUid"}), 400)
 
-    task_type = str(payload.get("taskType", "")).strip()
-    # manual：兼容旧版插件的本地粘贴命名；统一入库为 local，方便看板筛选和聚合。
-    if task_type == "manual":
-        task_type = "local"
+    task_type = normalize_task_type(payload.get("taskType"))
     if task_type not in ["local", "daily", "temp"]:
         return None, (jsonify({"ok": False, "error": "invalid_taskType"}), 400)
 
@@ -150,7 +400,6 @@ def validate_proxy_payload(payload):
     for field in number_fields:
         value = payload.get(field)
         try:
-            # 兼容前端万一传来 "12" 这类字符串数字
             number = int(value)
         except Exception:
             return None, (jsonify({"ok": False, "error": f"invalid_number_{field}"}), 400)
@@ -158,7 +407,6 @@ def validate_proxy_payload(payload):
         if number < 0:
             return None, (jsonify({"ok": False, "error": f"invalid_number_{field}"}), 400)
 
-        # 简单限幅，避免被刷入极端异常数字
         if field != "durationSeconds" and number > 100000:
             return None, (jsonify({"ok": False, "error": f"too_large_{field}"}), 400)
         if field == "durationSeconds" and number > 86400:
@@ -166,12 +414,114 @@ def validate_proxy_payload(payload):
 
         clean_report[field] = number
 
-    # 可选字段：不影响表格展示，但方便之后排查
     for optional_field in ["version", "extensionVersion", "taskName", "note"]:
         if optional_field in payload:
             clean_report[optional_field] = str(payload.get(optional_field, ""))[:200]
 
     return clean_report, None
+
+
+def require_admin_request():
+    token = str(request.args.get("token") or request.headers.get("X-Admin-Token") or "")
+    return bool(ADMIN_TOKEN and token == ADMIN_TOKEN)
+
+
+def record_identity(record):
+    # 用于迁移脚本去重；正常上报仍保留每次上报。
+    keys = [
+        "userUid", "taskType", "timestamp", "received_at", "totalParsed",
+        "submitted", "failed", "whitelistSkipped", "durationSeconds", "clientType"
+    ]
+    return json.dumps({k: record.get(k) for k in keys}, ensure_ascii=False, sort_keys=True)
+
+
+def migrate_legacy_reports(limit=0):
+    if not init_git_repo():
+        return {"ok": False, "error": "github_not_configured_or_clone_failed"}
+
+    legacy_files = sorted(glob.glob(os.path.join(GITHUB_REPO_DIR, "reports_*.json")))
+    if limit and limit > 0:
+        legacy_files = legacy_files[:limit]
+
+    collected = []
+    for path in legacy_files:
+        data = read_json_file(path, None)
+        if isinstance(data, list):
+            collected.extend([x for x in data if isinstance(x, dict)])
+        elif isinstance(data, dict):
+            collected.append(data)
+
+    root_reports = read_json_file(os.path.join(GITHUB_REPO_DIR, DATA_FILE), [])
+    if isinstance(root_reports, list):
+        collected.extend([x for x in root_reports if isinstance(x, dict)])
+
+    grouped = {}
+    for r in collected:
+        r = dict(r)
+        r["taskType"] = normalize_task_type(r.get("taskType"))
+        if not r.get("received_at"):
+            r["received_at"] = r.get("timestamp") or now_iso()
+        date = record_day_key(r)
+        grouped.setdefault(date, []).append(r)
+
+    changed_paths = []
+    changed_days = []
+    added = 0
+    for date, new_records in grouped.items():
+        records_path, summary_path, month_key = archive_paths_for_date(date)
+        repo_records_path = os.path.join(GITHUB_REPO_DIR, records_path)
+        existing = read_json_file(repo_records_path, [])
+        if not isinstance(existing, list):
+            existing = []
+        seen = {record_identity(x) for x in existing if isinstance(x, dict)}
+        before = len(existing)
+        for r in new_records:
+            key = record_identity(r)
+            if key not in seen:
+                existing.append(r)
+                seen.add(key)
+        if len(existing) == before:
+            continue
+
+        write_json_file(repo_records_path, existing)
+        day_summary = summarize_records(date, existing, records_path)
+
+        repo_summary_path = os.path.join(GITHUB_REPO_DIR, summary_path)
+        summary = read_json_file(repo_summary_path, {"month": month_key, "days": {}})
+        if not isinstance(summary, dict):
+            summary = {"month": month_key, "days": {}}
+        summary["month"] = month_key
+        summary["days"] = summary.get("days") if isinstance(summary.get("days"), dict) else {}
+        summary["days"][date] = day_summary
+        summary["updatedAt"] = now_iso()
+        write_json_file(repo_summary_path, summary)
+
+        changed_paths.extend([records_path, summary_path])
+        changed_days.append(normalize_latest_entry(day_summary, summary_path, month_key))
+        added += len(existing) - before
+
+    if changed_days:
+        repo_latest_path = os.path.join(GITHUB_REPO_DIR, LATEST_INDEX_PATH)
+        latest = read_json_file(repo_latest_path, default_latest_index())
+        for entry in changed_days:
+            latest = update_latest_index(latest, entry)
+        write_json_file(repo_latest_path, latest)
+        changed_paths.append(LATEST_INDEX_PATH)
+
+    if changed_paths:
+        run_git_command(["git", "add", *sorted(set(changed_paths))], cwd=GITHUB_REPO_DIR)
+        if not run_git_command(["git", "diff", "--cached", "--quiet"], cwd=GITHUB_REPO_DIR, quiet=True):
+            run_git_command(["git", "commit", "-m", f"Migrate legacy task reports into archive ({added} records)"], cwd=GITHUB_REPO_DIR)
+            run_git_command(["git", "push", "origin", GITHUB_BRANCH], cwd=GITHUB_REPO_DIR)
+
+    return {
+        "ok": True,
+        "legacyFilesScanned": len(legacy_files),
+        "recordsScanned": len(collected),
+        "recordsAddedToArchive": added,
+        "daysChanged": sorted({x.get("date") for x in changed_days}, reverse=True),
+        "changedPaths": sorted(set(changed_paths)),
+    }
 
 
 @app.after_request
@@ -204,11 +554,10 @@ def report():
     if not isinstance(new_report, dict):
         return jsonify({"error": "Invalid data"}), 400
 
-    # 保持 APK 原上报逻辑不变，只补一个来源标记，方便后台区分。
     new_report.setdefault('clientType', 'android-apk')
-    append_report(new_report)
+    archive_date, archive_path = append_report(new_report)
 
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "archiveDate": archive_date, "archivePath": archive_path})
 
 
 @app.route('/api/report-proxy', methods=['POST', 'OPTIONS'])
@@ -222,7 +571,6 @@ def report_proxy():
     if request.method == 'OPTIONS':
         return ('', 204)
 
-    # 如果你在 Render 设置了 ALLOWED_EXTENSION_ORIGIN，这里会严格检查来源。
     if ALLOWED_EXTENSION_ORIGIN:
         origin = request.headers.get("Origin", "")
         if origin != ALLOWED_EXTENSION_ORIGIN:
@@ -233,8 +581,33 @@ def report_proxy():
     if error_response:
         return error_response
 
-    append_report(clean_report)
-    return jsonify({"ok": True})
+    archive_date, archive_path = append_report(clean_report)
+    return jsonify({"ok": True, "archiveDate": archive_date, "archivePath": archive_path})
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    latest = read_repo_or_local_json(LATEST_INDEX_PATH, default_latest_index())
+    return jsonify({
+        "ok": True,
+        "service": "lid_monitor",
+        "timezone": SERVER_TIMEZONE,
+        "serverBeijingDate": beijing_day_key(),
+        "githubEnabled": bool(GITHUB_REPO_URL),
+        "githubRepoDir": GITHUB_REPO_DIR,
+        "branch": GITHUB_BRANCH,
+        "latestIndexPath": LATEST_INDEX_PATH,
+        "latestDate": latest.get("latestDate", "") if isinstance(latest, dict) else "",
+    })
+
+
+@app.route('/api/migrate-legacy', methods=['GET', 'POST'])
+def migrate_legacy():
+    if not require_admin_request():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    limit = count(request.args.get("limit"), 0)
+    result = migrate_legacy_reports(limit=limit)
+    return jsonify(result)
 
 
 @app.route('/download', methods=['GET'])
@@ -246,10 +619,11 @@ def download_data():
 
 @app.route('/download-all', methods=['GET'])
 def download_all():
-    """打包所有 reports_*.json 文件为 ZIP 下载"""
-    files = [f for f in os.listdir('.') if f.startswith('reports_') and f.endswith('.json')]
+    """打包当前 Render 本地 reports_*.json 和 archive/reports/**/*.json 为 ZIP 下载。"""
+    files = [f for f in glob.glob('reports_*.json') if os.path.isfile(f)]
+    files += [f for f in glob.glob(f'{ARCHIVE_RECORDS_DIR}/**/*.json', recursive=True) if os.path.isfile(f)]
     if not files:
-        return "没有找到任何 reports_*.json 文件", 404
+        return "没有找到任何 reports_*.json 或 archive/reports/**/*.json 文件", 404
 
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
@@ -257,7 +631,7 @@ def download_all():
             zip_file.write(file)
 
     zip_buffer.seek(0)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(TZ).strftime("%Y%m%d_%H%M%S")
     return send_file(
         zip_buffer,
         as_attachment=True,
@@ -266,10 +640,31 @@ def download_all():
     )
 
 
+def load_records_from_archive(date=None):
+    latest = read_repo_or_local_json(LATEST_INDEX_PATH, default_latest_index())
+    target_date = normalize_date(date) if date else ""
+    records_path = ""
+    source_label = "local-session"
+
+    if target_date:
+        records_path, _, _ = archive_paths_for_date(target_date)
+    elif isinstance(latest, dict) and latest.get("latestRecordsPath"):
+        target_date = latest.get("latestDate", "")
+        records_path = latest.get("latestRecordsPath", "")
+
+    if records_path:
+        records = read_repo_or_local_json(records_path, [])
+        if isinstance(records, list):
+            source_label = records_path
+            return target_date, source_label, records
+    return target_date or beijing_day_key(), source_label, load_data()
+
+
 @app.route('/')
 @app.route('/view')
 def index():
-    all_data = load_data()
+    date_arg = request.args.get('date')
+    current_date, source_label, all_data = load_records_from_archive(date_arg)
     html = '''
     <!DOCTYPE html>
     <html>
@@ -284,21 +679,27 @@ def index():
             .toolbar { margin-bottom: 20px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
             .btn { background-color: #1d1d1f; color: white; border: none; padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 14px; text-decoration: none; display: inline-block; }
             .btn:hover { background-color: #3a3a3c; }
+            input { border: 1px solid #d1d1d6; border-radius: 8px; padding: 7px 10px; font-size: 14px; }
             table { width: 100%; border-collapse: collapse; font-size: 13px; }
             th, td { border: 1px solid #e5e5ea; padding: 8px 10px; text-align: left; }
             th { background-color: #f5f5f7; font-weight: 600; }
             tr:nth-child(even) { background-color: #fafafc; }
             .footer { margin-top: 20px; font-size: 12px; color: #8e8e93; text-align: center; }
+            .muted { font-size:13px; color:#6e6e73; }
         </style>
     </head>
     <body>
         <div class="container">
             <h1>📊 豆瓣举报任务统计</h1>
-            <div class="toolbar">
-                <a href="/download" class="btn">⬇️ 下载 reports.json 备份</a>
-                <a href="/download-all" class="btn">📦 下载全部 reports_*.json (ZIP)</a>
-                <span style="font-size:13px; color:#6e6e73;">总上报次数: ''' + str(len(all_data)) + '''</span>
-            </div>
+            <form class="toolbar" method="get" action="/view">
+                <a href="/download" class="btn">⬇️ 下载当前进程 reports.json</a>
+                <a href="/download-all" class="btn">📦 下载本地归档 ZIP</a>
+                <span class="muted">显示日期: ''' + escape(str(current_date)) + '''</span>
+                <span class="muted">数据源: ''' + escape(str(source_label)) + '''</span>
+                <input type="date" name="date" value="''' + escape(str(current_date)) + '''">
+                <button class="btn" type="submit">加载日期</button>
+                <span class="muted">上报次数: ''' + str(len(all_data)) + '''</span>
+            </form>
             <div style="overflow-x: auto;">
                 <table>
                     <thead>
@@ -326,7 +727,7 @@ def index():
                 </table>
             </div>
             <div class="footer">
-                数据已自动同步到 GitHub 私有仓库，每次上报均生成独立备份文件。也可点击上方按钮打包下载全部 JSON 文件。
+                新数据已按 <code>archive/reports/年/月/日期.json</code> 写入 GitHub，并通过 <code>latest.json</code> 提供最新索引；不再依赖仓库根目录 reports_*.json 列表。
             </div>
         </div>
     </body>
@@ -338,4 +739,4 @@ def index():
 if __name__ == '__main__':
     if GITHUB_REPO_URL:
         init_git_repo()
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', '5000')))
