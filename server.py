@@ -142,11 +142,7 @@ def run_git_command(cmds, cwd=None, quiet=False, timeout=None):
 
 
 def init_git_repo(refresh=True):
-    """确保本地仓库明确处于 GITHUB_BRANCH。
-
-    refresh=True 时从远端刷新目标分支；同一次上报只应调用一次 refresh，
-    避免一个 HTTP 请求内重复 fetch/pull。
-    """
+    """确保本地仓库处于目标分支，并在任何 checkout/commit 前配置 Git 身份。"""
     if not GITHUB_REPO_URL:
         print("未配置 GITHUB_REPO_URL，跳过自动同步")
         return False
@@ -168,22 +164,46 @@ def init_git_repo(refresh=True):
                 "GITHUB_BRANCH 是否与 GitHub 仓库实际分支一致。"
             )
             return False
-    elif refresh:
-        # fetch 目标分支后显式建立/重置本地同名分支，避免
-        # `src refspec main does not match any`。
+
+    # 无论后续 fetch / checkout 是否成功，先写入仓库级 Git 身份。
+    if not run_git_command(
+        ["git", "config", "user.email", "render@backup"],
+        cwd=GITHUB_REPO_DIR,
+    ):
+        return False
+    if not run_git_command(
+        ["git", "config", "user.name", "Render Backup"],
+        cwd=GITHUB_REPO_DIR,
+    ):
+        return False
+
+    if refresh:
         if not run_git_command(
             ["git", "fetch", "origin", GITHUB_BRANCH],
             cwd=GITHUB_REPO_DIR,
         ):
             return False
+
+        # 上一次失败可能在 /tmp/repo 留下未提交修改。
+        # 这些文件只是 Render 待同步副本；真实待写数据仍保存在项目工作目录，
+        # 因此这里先清理仓库副本，再对齐远端分支，避免 checkout 被阻塞。
+        run_git_command(
+            ["git", "reset", "--hard", f"origin/{GITHUB_BRANCH}"],
+            cwd=GITHUB_REPO_DIR,
+            quiet=True,
+        )
+        run_git_command(
+            ["git", "clean", "-fd"],
+            cwd=GITHUB_REPO_DIR,
+            quiet=True,
+        )
+
         if not run_git_command(
             ["git", "checkout", "-B", GITHUB_BRANCH, f"origin/{GITHUB_BRANCH}"],
             cwd=GITHUB_REPO_DIR,
         ):
             return False
 
-    run_git_command(["git", "config", "user.email", "render@backup"], cwd=GITHUB_REPO_DIR, quiet=True)
-    run_git_command(["git", "config", "user.name", "Render Backup"], cwd=GITHUB_REPO_DIR, quiet=True)
     return True
 
 
@@ -343,7 +363,7 @@ def update_latest_index(latest, entry):
 
 def append_record_to_archive(record):
     # 先拉取远端，再基于远端当天文件追加，避免 Render 重启后覆盖 GitHub 中已有日期数据。
-    init_git_repo()
+    repo_ready = init_git_repo(refresh=True)
 
     date = record_day_key(record)
     records_path, summary_path, month_key = archive_paths_for_date(date)
@@ -368,11 +388,14 @@ def append_record_to_archive(record):
     latest = update_latest_index(latest, normalize_latest_entry(day_summary, summary_path, month_key))
     write_json_file(LATEST_INDEX_PATH, latest)
 
-    commit_repo_paths(
-        [records_path, summary_path, LATEST_INDEX_PATH, DATA_FILE],
-        f"Auto-save task report {date}",
-        repo_ready=True,
-    )
+    if repo_ready:
+        commit_repo_paths(
+            [records_path, summary_path, LATEST_INDEX_PATH, DATA_FILE],
+            f"Auto-save task report {date}",
+            repo_ready=True,
+        )
+    else:
+        print("Git 仓库未就绪：本次数据仅写入 Render 本地，未尝试 commit/push")
     return date, records_path
 
 
